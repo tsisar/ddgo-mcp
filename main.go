@@ -78,7 +78,7 @@ func main() {
 }
 
 func serve(addr string) {
-	s := server.NewMCPServer("ddgo-mcp", "0.1.0")
+	s := server.NewMCPServer("ddgo-mcp", version)
 
 	s.AddTool(
 		mcp.NewTool("search",
@@ -97,8 +97,19 @@ func serve(addr string) {
 		handleFetch,
 	)
 
-	log.Printf("ddgo-mcp %s: SSE on %s (endpoint /sse)", version, addr)
-	if err := server.NewSSEServer(s).Start(addr); err != nil {
+	// Mount the SSE handlers on our own mux so we can add /healthz for
+	// Kubernetes liveness/readiness probes (the gateway connects to /sse).
+	sse := server.NewSSEServer(s)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	})
+	mux.Handle("/sse", sse.SSEHandler())
+	mux.Handle("/message", sse.MessageHandler())
+
+	log.Printf("ddgo-mcp %s: listening on %s (/sse, /message, /healthz)", version, addr)
+	if err := (&http.Server{Addr: addr, Handler: mux}).ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
