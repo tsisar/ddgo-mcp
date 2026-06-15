@@ -1,0 +1,8 @@
+# Build output
+/ddgo-mcp
+/dist/
+
+# Editor / OS
+/.idea/
+.vscode/
+.DS_Store
