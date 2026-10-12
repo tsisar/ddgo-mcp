@@ -9,8 +9,8 @@ backend, alongside other tool servers.
 
 | Tool | Args | Returns |
 |------|------|---------|
-| `search` | `query` (string, required), `max_results` (number, 1–10, default 5) | Top results as title / url / snippet (scrapes DuckDuckGo HTML — no API key) |
-| `fetch`  | `url` (string, required) | Main readable text of the page ([go-readability](https://github.com/go-shiori/go-readability)); truncated to ~4000 chars |
+| `search` | `query` (string, required), `max_results` (number, 1–10, default 5), `freshness` (`day`/`week`/`month`/`year`, optional) | Top results as title / url / snippet (scrapes DuckDuckGo HTML — no API key), ranked for `REGION` |
+| `fetch`  | `url` (string, required) | Title, the page's published/updated dates when it declares them, and its main readable text ([go-readability](https://github.com/go-shiori/go-readability)); truncated to ~4000 chars |
 
 `fetch` does not render JavaScript, so JS-only SPAs return little; typical
 articles/wikis/docs work well. Search snippets alone often answer a question.
@@ -19,11 +19,12 @@ articles/wikis/docs work well. Search snippets alone often answer a question.
 
 ```sh
 go run .                    # serve SSE on :8000  (endpoint /sse)
-go run . -q "who won euro 2024"   # local test: search
+go run . -q "who won euro 2024"   # local test: search (-f week for a freshness window)
 go run . -u "https://en.wikipedia.org/wiki/Go_(programming_language)"  # local test: fetch
 ```
 
-Config: `ADDR` (default `:8000`).
+Config: `ADDR` (default `:8000`), `REGION` (DuckDuckGo market, default `ua-uk`;
+empty for none).
 
 ## Docker
 
@@ -46,3 +47,8 @@ as `<target>_search` / `<target>_fetch` at the gateway endpoint.
   non-browser clients.
 - Bot-protected sites (heavy WAFs) may time out on `fetch`; that's expected, the
   caller can fall back to search snippets.
+- DuckDuckGo rate-limits by address: after a burst of requests it serves a
+  CAPTCHA page (HTTP 202) for a while. `search` reports that as an error
+  ("search unavailable … CAPTCHA") rather than as no results, keeps 1.5 s
+  between requests and caches identical queries for 10 minutes, so a model
+  retrying does not dig the hole deeper. Every call is logged with its outcome.

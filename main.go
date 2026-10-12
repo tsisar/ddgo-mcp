@@ -4,13 +4,14 @@
 // namespaces the tools as <target>_search and <target>_fetch.
 //
 //	ddgo-mcp                    # serve SSE on :8000 (endpoint /sse)
-//	ddgo-mcp -q "golang 1.25"   # local test: run a search and print
+//	ddgo-mcp -q "golang 1.25"   # local test: run a search and print (-f week for the freshness window)
 //	ddgo-mcp -u "https://..."   # local test: fetch a page and print
 package main
 
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -38,6 +39,10 @@ const (
 	maxText   = 4000    // runes of readable text returned by fetch
 )
 
+// region is DuckDuckGo's kl parameter: results ranked for this market and
+// language rather than for the US. REGION="" turns it off.
+var region = envOr("REGION", "ua-uk")
+
 // httpClient forces HTTP/1.1: some CDNs reset the HTTP/2 stream for non-browser
 // clients (INTERNAL_ERROR), which broke fetches.
 var httpClient = &http.Client{
@@ -53,13 +58,14 @@ var httpClient = &http.Client{
 func main() {
 	addr := flag.String("addr", envOr("ADDR", ":8000"), "listen address for the SSE server")
 	q := flag.String("q", "", "local test: run a search for this query and print")
+	f := flag.String("f", "", "local test: freshness window for -q (day, week, month, year)")
 	u := flag.String("u", "", "local test: fetch this URL and print readable text")
 	flag.Parse()
 
 	ctx := context.Background()
 	switch {
 	case *q != "":
-		results, err := ddgSearch(ctx, *q, 5)
+		results, err := newSearcher(httpClient, region).search(ctx, *q, *f, 5)
 		if err != nil {
 			log.Fatalf("search: %v", err)
 		}
@@ -79,14 +85,19 @@ func main() {
 
 func serve(addr string) {
 	s := server.NewMCPServer("ddgo-mcp", version)
+	ddg := newSearcher(httpClient, region)
 
 	s.AddTool(
 		mcp.NewTool("search",
-			mcp.WithDescription("Search the web via DuckDuckGo for current or factual information. Returns the top results as title, url and snippet. Often the snippets alone answer the question."),
+			mcp.WithDescription("Search the web via DuckDuckGo for current or factual information. Returns the top results as title, url and snippet. Often the snippets alone answer the question. For news, prices, weather or anything that changes, set freshness so old pages are left out."),
 			mcp.WithString("query", mcp.Required(), mcp.Description("The search query")),
 			mcp.WithNumber("max_results", mcp.Description("Number of results to return (default 5, max 10)")),
+			mcp.WithString("freshness", mcp.Description("Only pages from the last day, week, month or year; omit for any time"),
+				mcp.Enum("day", "week", "month", "year")),
 		),
-		handleSearch,
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return handleSearch(ctx, ddg, req)
+		},
 	)
 
 	s.AddTool(
@@ -114,7 +125,7 @@ func serve(addr string) {
 	}
 }
 
-func handleSearch(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func handleSearch(ctx context.Context, ddg *searcher, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	query, err := req.RequireString("query")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -126,8 +137,19 @@ func handleSearch(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	if n > 10 {
 		n = 10
 	}
+	fresh := req.GetString("freshness", "")
+	if fresh != "" && freshness[fresh] == "" {
+		return mcp.NewToolResultError("freshness must be day, week, month or year"), nil
+	}
 
-	results, err := ddgSearch(ctx, query, n)
+	start := time.Now()
+	results, err := ddg.search(ctx, query, fresh, n)
+	logSearch(query, fresh, len(results), err, time.Since(start))
+	if errors.Is(err, ErrChallenge) {
+		// Said plainly, so the model tells the person rather than answering
+		// from memory as if the web had nothing on it.
+		return mcp.NewToolResultError("search unavailable: DuckDuckGo is rate-limiting this address right now (CAPTCHA). Do not retry at once; tell the user the web search is temporarily unavailable, or try again in a few minutes."), nil
+	}
 	if err != nil {
 		return mcp.NewToolResultError("search failed: " + err.Error()), nil
 	}
@@ -147,92 +169,14 @@ func handleFetch(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRes
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	start := time.Now()
 	text, err := fetchReadable(ctx, pageURL)
 	if err != nil {
+		log.Printf("fetch %s: %v (%s)", pageURL, err, time.Since(start).Round(time.Millisecond))
 		return mcp.NewToolResultError("fetch failed: " + err.Error()), nil
 	}
+	log.Printf("fetch %s: %d chars (%s)", pageURL, len(text), time.Since(start).Round(time.Millisecond))
 	return mcp.NewToolResultText(text), nil
-}
-
-// ---- search --------------------------------------------------------------
-
-type result struct {
-	Title   string
-	URL     string
-	Snippet string
-}
-
-func ddgSearch(ctx context.Context, query string, n int) ([]result, error) {
-	endpoint := ddgHTML + "?q=" + url.QueryEscape(query)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", userAgent)
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("duckduckgo returned http %d", resp.StatusCode)
-	}
-
-	doc, err := html.Parse(io.LimitReader(resp.Body, maxBody))
-	if err != nil {
-		return nil, err
-	}
-
-	var links []result
-	var snippets []string
-	var walk func(*html.Node)
-	walk = func(node *html.Node) {
-		if node.Type == html.ElementNode {
-			switch {
-			case node.Data == "a" && hasClass(node, "result__a"):
-				links = append(links, result{Title: textOf(node), URL: decodeDDGURL(attr(node, "href"))})
-			case hasClass(node, "result__snippet"):
-				snippets = append(snippets, textOf(node))
-			}
-		}
-		for c := node.FirstChild; c != nil; c = c.NextSibling {
-			walk(c)
-		}
-	}
-	walk(doc)
-
-	out := make([]result, 0, n)
-	for i := range links {
-		if i >= n {
-			break
-		}
-		r := links[i]
-		if i < len(snippets) {
-			r.Snippet = snippets[i]
-		}
-		out = append(out, r)
-	}
-	return out, nil
-}
-
-// decodeDDGURL turns a DuckDuckGo redirect href (//duckduckgo.com/l/?uddg=...)
-// into the real destination URL.
-func decodeDDGURL(href string) string {
-	if href == "" {
-		return ""
-	}
-	if strings.HasPrefix(href, "//") {
-		href = "https:" + href
-	}
-	u, err := url.Parse(href)
-	if err != nil {
-		return href
-	}
-	if real := u.Query().Get("uddg"); real != "" {
-		return real
-	}
-	return href
 }
 
 // ---- fetch (readability) -------------------------------------------------
@@ -269,8 +213,20 @@ func fetchReadable(ctx context.Context, pageURL string) (string, error) {
 	if r := []rune(text); len(r) > maxText {
 		text = string(r[:maxText]) + "…"
 	}
+	var head []string
 	if title := strings.TrimSpace(art.Title); title != "" {
-		return title + "\n\n" + text, nil
+		head = append(head, title)
+	}
+	// The page's own dates, when it declares them: the one thing the model
+	// needs to tell a current article from a stale one.
+	if art.PublishedTime != nil {
+		head = append(head, "Published: "+art.PublishedTime.Format("2006-01-02"))
+	}
+	if art.ModifiedTime != nil && (art.PublishedTime == nil || !art.ModifiedTime.Equal(*art.PublishedTime)) {
+		head = append(head, "Updated: "+art.ModifiedTime.Format("2006-01-02"))
+	}
+	if len(head) > 0 {
+		return strings.Join(head, "\n") + "\n\n" + text, nil
 	}
 	return text, nil
 }
